@@ -1,0 +1,52 @@
+# One 9P export. Deploy one of these per volume you want to share.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jetstream-ufs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+spec:
+  selector:
+    app: ufs
+  ports:
+    - name: 9p
+      port: 5640
+      targetPort: 5640
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ufs
+  template:
+    metadata:
+      labels:
+        app: ufs
+    spec:
+      containers:
+        - name: ufs
+          image: k8s-jetstream-ufs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--root", "/export", "--listen", "0.0.0.0:5640"]
+          ports:
+            - containerPort: 5640
+          volumeMounts:
+            - name: export
+              mountPath: /export
+          readinessProbe:
+            tcpSocket:
+              port: 5640
+      volumes:
+        - name: export
+          emptyDir: {} # swap for a PVC to persist data

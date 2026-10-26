@@ -1,0 +1,50 @@
+# Static provisioning: a PV pointing at the export, a PVC, and a pod using it.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ufs-example
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: default
+    name: ufs-example
+  csi:
+    driver: ufs.jetstream.rs
+    volumeHandle: ufs-example
+    volumeAttributes:
+      server: ufs.jetstream-ufs.svc.cluster.local
+      port: "5640"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ufs-example
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: ufs-example
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ufs-writer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "cat /data/seed.txt && echo from-writer > /data/written.txt && sync"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ufs-example
