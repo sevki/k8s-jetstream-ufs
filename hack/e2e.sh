@@ -14,7 +14,7 @@ dump() {
   kubectl get pods -A -o wide || true
   kubectl describe pod ufs-writer || true
   kubectl -n kube-system logs ds/ufs-csi-node -c driver --tail=100 || true
-  kubectl -n jetstream-ufs logs deploy/ufs --tail=100 || true
+  kubectl -n jetstream-ufs logs deploy/ufs --all-containers --tail=100 || true
 }
 trap 'dump' ERR
 
@@ -24,7 +24,7 @@ kind load docker-image "$IMAGE" --name "$CLUSTER"
 
 kubectl apply -f deploy/server.yaml
 kubectl -n jetstream-ufs rollout status deploy/ufs --timeout=120s
-kubectl -n jetstream-ufs exec deploy/ufs -- sh -c 'echo seed-data > /export/seed.txt'
+kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- sh -c 'echo seed-data > /export/seed.txt'
 
 kubectl apply -f deploy/csi-driver.yaml
 kubectl -n kube-system rollout status ds/ufs-csi-node --timeout=180s
@@ -35,7 +35,7 @@ kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/ufs-writer --timeout
 # The pod read the file seeded on the server...
 test "$(kubectl logs ufs-writer)" = "seed-data"
 # ...and what it wrote landed in the server's export directory.
-test "$(kubectl -n jetstream-ufs exec deploy/ufs -- cat /export/written.txt)" = "from-writer"
+test "$(kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- cat /export/written.txt)" = "from-writer"
 
 # A second pod on the same volume sees the data (ReadWriteMany) and unmount works on delete.
 kubectl delete pod ufs-writer --wait
@@ -45,4 +45,26 @@ kubectl run ufs-reader --image=busybox:1.36 --restart=Never --overrides='{
   "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"ufs-example"}}]}}'
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/ufs-reader --timeout=120s
 test "$(kubectl logs ufs-reader)" = "from-writer"
+kubectl delete pod ufs-reader --wait
+
+# Dynamic provisioning: each PVC gets an isolated directory on the shared export.
+kubectl apply -f deploy/storageclass.yaml
+kubectl apply -f deploy/example-dynamic.yaml
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/dyn-a pod/dyn-b --timeout=180s
+# each pod only sees its own `who` file (the listing is just `who`, not the other volume's data)
+test "$(kubectl logs dyn-a)" = "who"
+test "$(kubectl logs dyn-b)" = "who"
+PVA=$(kubectl get pvc dyn-a -o jsonpath='{.spec.volumeName}')
+PVB=$(kubectl get pvc dyn-b -o jsonpath='{.spec.volumeName}')
+test "$(kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- cat /export/$PVA/who)" = "only-in-a"
+test "$(kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- cat /export/$PVB/who)" = "only-in-b"
+
+# Deleting the PVC deletes the directory.
+kubectl delete pod dyn-a dyn-b --wait
+kubectl delete pvc dyn-a dyn-b --wait
+for i in $(seq 30); do
+  kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- test ! -e /export/$PVA && break
+  sleep 2
+done
+kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- test ! -e /export/$PVA
 echo "e2e OK"

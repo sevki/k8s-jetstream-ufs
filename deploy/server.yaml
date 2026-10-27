@@ -34,7 +34,23 @@ spec:
       labels:
         app: ufs
     spec:
+      serviceAccountName: ufs
       containers:
+        - name: controller # CSI controller: creates/deletes per-volume directories under /export
+          image: k8s-jetstream-ufs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["csi", "--endpoint", "/csi/csi.sock", "--controller-export-root", "/export"]
+          volumeMounts:
+            - name: export
+              mountPath: /export
+            - name: socket
+              mountPath: /csi
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.1
+          args: ["--csi-address=/csi/csi.sock", "--v=2"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
         - name: ufs
           image: k8s-jetstream-ufs:dev
           imagePullPolicy: IfNotPresent
@@ -48,5 +64,47 @@ spec:
             tcpSocket:
               port: 5640
       volumes:
+        - name: socket
+          emptyDir: {}
         - name: export
           emptyDir: {} # swap for a PVC to persist data
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ufs-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ufs-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ufs-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: ufs
+    namespace: jetstream-ufs

@@ -18,7 +18,12 @@ kubectl apply -f deploy/csi-driver.yaml  # CSIDriver + node DaemonSet
 kubectl apply -f deploy/example.yaml     # PV/PVC/Pod using volumeAttributes {server, port}
 ```
 
-Nodes need the `9p` and `9pnet` kernel modules. Each server exports one directory, so one PV per export.
+Dynamic provisioning: `kubectl apply -f deploy/storageclass.yaml`, then create PVCs with `storageClassName: ufs`
+(see `deploy/example-dynamic.yaml`). Each PVC gets its own directory on the export (`subpath` volume attribute →
+9P attach name); deleting the PVC deletes the directory. The controller runs next to the server and shares its
+`/export` volume.
+
+Nodes need the `9p` and `9pnet` kernel modules. Static PVs may set `subpath` in `volumeAttributes` to mount a subdirectory of the export.
 
 ## Tests
 

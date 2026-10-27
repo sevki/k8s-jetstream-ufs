@@ -95,6 +95,10 @@ fn start(root: &std::path::Path) -> (Server, Client) {
 }
 
 fn handshake(c: &mut Client) {
+    attach(c, "/");
+}
+
+fn attach(c: &mut Client, aname: &str) {
     let mut b = 65536u32.to_le_bytes().to_vec();
     s(&mut b, "9P2000.L");
     let r = c.call(100, &b);
@@ -102,7 +106,7 @@ fn handshake(c: &mut Client) {
 
     let mut b = [0u32.to_le_bytes(), NOFID.to_le_bytes()].concat();
     s(&mut b, "root");
-    s(&mut b, "/");
+    s(&mut b, aname);
     b.extend(0u32.to_le_bytes());
     c.call(104, &b);
 }
@@ -135,6 +139,46 @@ fn read_existing_file_and_write_new_file() {
     c.call(120, &2u32.to_le_bytes()); // clunk
 
     assert_eq!(std::fs::read(dir.join("new.txt")).unwrap(), data);
+}
+
+#[test]
+fn attach_name_selects_subdirectory() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.join("vol-a")).unwrap();
+    std::fs::write(dir.join("vol-a/f.txt"), "in a").unwrap();
+    std::fs::write(dir.join("top.txt"), "top").unwrap();
+    let (_srv, mut c) = start(&dir);
+    let mut b = 65536u32.to_le_bytes().to_vec();
+    s(&mut b, "9P2000.L");
+    c.call(100, &b);
+    attach(&mut c, "vol-a");
+    c.walk(0, 1, &["f.txt"]);
+    assert_eq!(c.read_all(1), b"in a");
+}
+
+#[test]
+fn attach_rejects_escape_and_missing() {
+    let dir = tempdir();
+    let (_srv, mut c) = start(&dir);
+    let mut b = 65536u32.to_le_bytes().to_vec();
+    s(&mut b, "9P2000.L");
+    c.call(100, &b);
+    for aname in ["../etc", "nope"] {
+        let mut b = [0u32.to_le_bytes(), NOFID.to_le_bytes()].concat();
+        s(&mut b, "root");
+        s(&mut b, aname);
+        b.extend(0u32.to_le_bytes());
+        let mut m = ((7 + b.len()) as u32).to_le_bytes().to_vec();
+        m.push(104);
+        m.extend(1u16.to_le_bytes());
+        m.extend(&b);
+        c.0.write_all(&m).unwrap();
+        let mut hdr = [0u8; 7];
+        c.0.read_exact(&mut hdr).unwrap();
+        assert_eq!(hdr[4], 7, "{aname} should get Rlerror");
+        let mut rest = [0u8; 4];
+        c.0.read_exact(&mut rest).unwrap();
+    }
 }
 
 fn tempdir() -> std::path::PathBuf {

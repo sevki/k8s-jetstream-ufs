@@ -1,0 +1,12 @@
+# Dynamic provisioning: every PVC gets its own directory on the export served by
+# deploy/server.yaml. `server` is the Service name (resolved on the node by the CSI plugin).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ufs
+provisioner: ufs.jetstream.rs
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  server: ufs.jetstream-ufs.svc.cluster.local
+  port: "5640"

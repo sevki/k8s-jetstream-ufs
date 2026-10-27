@@ -28,8 +28,12 @@ enum Cmd {
     Csi {
         #[arg(long, default_value = "/csi/csi.sock")]
         endpoint: PathBuf,
-        #[arg(long, env = "NODE_ID")]
+        #[arg(long, env = "NODE_ID", default_value = "controller")]
         node_id: String,
+        /// Run the controller service (create/delete volumes as directories here)
+        /// instead of the node service. Must be the server's export directory.
+        #[arg(long)]
+        controller_export_root: Option<PathBuf>,
     },
 }
 
@@ -46,6 +50,10 @@ async fn main() -> anyhow::Result<()> {
             listen,
             socket,
         } => server::serve(root, listen, socket).await,
-        Cmd::Csi { endpoint, node_id } => csi::run(endpoint, node_id).await,
+        Cmd::Csi {
+            endpoint,
+            node_id,
+            controller_export_root,
+        } => csi::run(endpoint, node_id, controller_export_root).await,
     }
 }
