@@ -130,7 +130,7 @@ impl Identity for Plugin {
         _: Request<GetPluginCapabilitiesRequest>,
     ) -> Result<Response<GetPluginCapabilitiesResponse>, Status> {
         Ok(Response::new(GetPluginCapabilitiesResponse {
-            capabilities: vec![],
+            capabilities: self.plugin_capabilities(),
         }))
     }
 
@@ -409,6 +409,19 @@ impl Controller for Plugin {
 }
 
 impl Plugin {
+    fn plugin_capabilities(&self) -> Vec<PluginCapability> {
+        if self.export_root.is_none() {
+            return vec![];
+        }
+        vec![PluginCapability {
+            r#type: Some(plugin_capability::Type::Service(
+                plugin_capability::Service {
+                    r#type: plugin_capability::service::Type::ControllerService as i32,
+                },
+            )),
+        }]
+    }
+
     fn root(&self) -> Result<&Path, Status> {
         self.export_root
             .as_deref()
@@ -479,6 +492,20 @@ mod tests {
         assert!(mount_options(5640, "/", true).ends_with(",ro"));
         assert!(!mount_options(5640, "/", false).contains(",ro"));
         assert!(mount_options(5640, "vol-1", false).contains("aname=vol-1"));
+    }
+
+    #[test]
+    fn controller_mode_reports_controller_service() {
+        let node = Plugin {
+            node_id: "n".into(),
+            export_root: None,
+        };
+        assert!(node.plugin_capabilities().is_empty());
+        let ctl = Plugin {
+            node_id: "n".into(),
+            export_root: Some("/export".into()),
+        };
+        assert_eq!(ctl.plugin_capabilities().len(), 1);
     }
 
     #[test]
