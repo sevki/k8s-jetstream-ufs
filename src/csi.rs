@@ -259,7 +259,12 @@ impl Node for Plugin {
         let target = PathBuf::from(&req.target_path);
         if is_mounted(&target)? {
             tracing::info!("unmounting {target:?}");
-            exec(Command::new("umount").arg(&target))?;
+            // Unmounting makes the kernel talk to our own proxy (final clunk), so it must not
+            // block a runtime worker the proxy tasks may need.
+            let t = target.clone();
+            tokio::task::spawn_blocking(move || exec(Command::new("umount").arg(&t)))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))??;
         }
         self.stop_proxy(&target);
         let _ = std::fs::remove_dir(&target);
