@@ -1,0 +1,14 @@
+# Dynamic provisioning over QUIC: every PVC gets its own directory on the export served by
+# deploy/server.yaml. `server` is the Service name; it is resolved on the node and is also the
+# TLS server name, so it must match a SAN of the server certificate.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ufs
+provisioner: ufs.jetstream.rs
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  transport: quic
+  server: ufs.jetstream-ufs.svc.cluster.local
+  port: "5641"

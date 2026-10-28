@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: unit + 9P protocol e2e tests
+        run: cargo test --locked
+
+  kind-e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: ensure 9p kernel support
+        run: |
+          sudo modprobe 9p 9pnet 9pnet_fd 2>/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe 9p 9pnet 9pnet_fd
+          }
+          grep -w 9p /proc/filesystems
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: kind e2e (server + CSI driver + pods)
+        run: hack/e2e.sh

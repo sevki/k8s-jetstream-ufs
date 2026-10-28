@@ -1,0 +1,138 @@
+# One 9P export. Deploy one of these per volume you want to share.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+spec:
+  selector:
+    app: ufs
+  ports:
+    - name: quic
+      protocol: UDP
+      port: 5641
+      targetPort: 5641
+    - name: iroh
+      protocol: UDP
+      port: 5642
+      targetPort: 5642
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ufs
+  template:
+    metadata:
+      labels:
+        app: ufs
+    spec:
+      serviceAccountName: ufs
+      containers:
+        - name: controller # CSI controller: creates/deletes per-volume directories under /export
+          image: k8s-jetstream-ufs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["csi", "--endpoint", "/csi/csi.sock", "--controller-export-root", "/export"]
+          volumeMounts:
+            - name: export
+              mountPath: /export
+            - name: socket
+              mountPath: /csi
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.1
+          args: ["--csi-address=/csi/csi.sock", "--v=2"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        - name: ufs
+          image: k8s-jetstream-ufs:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - --root=/export
+            - --quic-listen=0.0.0.0:5641
+            - --tls-cert=/tls/tls.crt
+            - --tls-key=/tls/tls.key
+            - --client-ca=/tls/ca.crt # mTLS: only clients with a cert from this CA may connect
+            - --iroh-listen=0.0.0.0:5642
+            - --iroh-secret-file=/iroh/key
+            - --socket=/run/ufs/ufs.sock
+          ports:
+            - containerPort: 5641
+              protocol: UDP
+            - containerPort: 5642
+              protocol: UDP
+          volumeMounts:
+            - name: export
+              mountPath: /export
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: iroh
+              mountPath: /iroh
+              readOnly: true
+            - name: run
+              mountPath: /run/ufs
+          readinessProbe: # the unix socket is bound after the QUIC and iroh listeners
+            exec:
+              command: ["test", "-S", "/run/ufs/ufs.sock"]
+      volumes:
+        - name: tls
+          secret:
+            secretName: ufs-tls # ca.crt, tls.crt, tls.key (see hack/gen-certs.sh)
+        - name: iroh
+          secret:
+            secretName: ufs-iroh # key (see `k8s-jetstream-ufs iroh-keygen`)
+        - name: run
+          emptyDir: {}
+        - name: socket
+          emptyDir: {}
+        - name: export
+          emptyDir: {} # swap for a PVC to persist data
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ufs
+  namespace: jetstream-ufs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ufs-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ufs-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ufs-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: ufs
+    namespace: jetstream-ufs

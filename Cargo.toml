@@ -1,0 +1,42 @@
+[package]
+name = "k8s-jetstream-ufs"
+version = "0.1.0"
+edition = "2021"
+description = "Kubernetes CSI driver and 9P2000.L file server built on jetstream"
+license = "BSD-3-Clause"
+
+[lib]
+name = "k8s_jetstream_ufs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k8s-jetstream-ufs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+jetstream_iroh = "16.0.0"
+jetstream_quic = "16.0.0"
+jetstream_rpc = "16.0.0"
+jetstream_ufs = "16.0.0"
+prost = "0.14"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+prost-types = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"

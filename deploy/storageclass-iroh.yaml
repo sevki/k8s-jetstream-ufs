@@ -1,0 +1,14 @@
+# Dynamic provisioning over iroh. `iroh-node` is the id printed by `k8s-jetstream-ufs iroh-keygen`
+# for the key in the ufs-iroh Secret. `iroh-addrs` are optional direct addresses; without them
+# iroh discovery and relays are used to find the node.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ufs-iroh
+provisioner: ufs.jetstream.rs
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  transport: iroh
+  iroh-node: REPLACE_WITH_NODE_ID
+  iroh-addrs: ufs.jetstream-ufs.svc.cluster.local:5642
