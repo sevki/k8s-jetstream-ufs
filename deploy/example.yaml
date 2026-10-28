@@ -16,8 +16,9 @@ spec:
     driver: ufs.jetstream.rs
     volumeHandle: ufs-example
     volumeAttributes:
+      transport: quic
       server: ufs.jetstream-ufs.svc.cluster.local
-      port: "5640"
+      port: "5641"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

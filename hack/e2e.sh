@@ -22,6 +22,21 @@ docker build -t "$IMAGE" .
 kind create cluster --name "$CLUSTER" --wait 120s
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 
+# mTLS material for QUIC, and an iroh identity for the server.
+WORK=$(mktemp -d)
+hack/gen-certs.sh "$WORK/certs"
+IROH_NODE=$(docker run --rm -v "$WORK:/out" "$IMAGE" iroh-keygen --out /out/iroh.key)
+echo "iroh node id: $IROH_NODE"
+
+kubectl apply -f deploy/namespace.yaml
+kubectl -n jetstream-ufs create secret generic ufs-tls \
+  --from-file=ca.crt="$WORK/certs/ca.crt" --from-file=tls.crt="$WORK/certs/server.crt" \
+  --from-file=tls.key="$WORK/certs/server.key"
+kubectl -n jetstream-ufs create secret generic ufs-iroh --from-file=key="$WORK/iroh.key"
+kubectl -n kube-system create secret generic ufs-csi-client-tls \
+  --from-file=ca.crt="$WORK/certs/ca.crt" --from-file=tls.crt="$WORK/certs/client.crt" \
+  --from-file=tls.key="$WORK/certs/client.key"
+
 kubectl apply -f deploy/server.yaml
 kubectl -n jetstream-ufs rollout status deploy/ufs --timeout=120s
 kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- sh -c 'echo seed-data > /export/seed.txt'
@@ -67,4 +82,11 @@ for i in $(seq 30); do
   sleep 2
 done
 kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- test ! -e /export/$PVA
+# The same, over iroh.
+sed "s/REPLACE_WITH_NODE_ID/$IROH_NODE/" deploy/storageclass-iroh.yaml | kubectl apply -f -
+kubectl apply -f deploy/example-iroh.yaml
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/iroh-a --timeout=180s
+PVI=$(kubectl get pvc iroh-a -o jsonpath='{.spec.volumeName}')
+test "$(kubectl -n jetstream-ufs exec deploy/ufs -c ufs -- cat /export/$PVI/who)" = "over-iroh"
+
 echo "e2e OK"

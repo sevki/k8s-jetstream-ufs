@@ -27,7 +27,12 @@ spec:
         - name: driver
           image: k8s-jetstream-ufs:dev
           imagePullPolicy: IfNotPresent
-          args: ["csi", "--endpoint", "/csi/csi.sock"]
+          args:
+            - csi
+            - --endpoint=/csi/csi.sock
+            - --tls-ca=/tls/ca.crt
+            - --tls-cert=/tls/tls.crt # client identity for servers that require mTLS
+            - --tls-key=/tls/tls.key
           env:
             - name: NODE_ID
               valueFrom:
@@ -41,6 +46,9 @@ spec:
             - name: pods
               mountPath: /var/lib/kubelet/pods
               mountPropagation: Bidirectional
+            - name: tls
+              mountPath: /tls
+              readOnly: true
         - name: registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.11.1
           args:
@@ -52,6 +60,9 @@ spec:
             - name: registration
               mountPath: /registration
       volumes:
+        - name: tls
+          secret:
+            secretName: ufs-csi-client-tls # ca.crt, tls.crt, tls.key (see hack/gen-certs.sh)
         - name: plugin-dir
           hostPath:
             path: /var/lib/kubelet/plugins/ufs.jetstream.rs

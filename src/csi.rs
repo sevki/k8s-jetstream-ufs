@@ -1,13 +1,16 @@
 //! Minimal CSI node plugin: mounts a jetstream 9P export with the kernel v9fs client.
 
 use std::{
-    net::{IpAddr, ToSocketAddrs},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
-use tokio::net::UnixListener;
+use tokio::{net::UnixListener, task::JoinHandle};
+
+use crate::transport::{proxy, ClientTls, Dialer, Target};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
@@ -18,7 +21,6 @@ pub mod pb {
 use pb::{controller_server::*, identity_server::*, node_server::*, *};
 
 pub const DRIVER_NAME: &str = "ufs.jetstream.rs";
-const DEFAULT_PORT: u16 = 5640;
 const MSIZE: u32 = 65536;
 
 /// Volume names become directory names under the export root.
@@ -34,50 +36,56 @@ pub fn valid_volume_name(name: &str) -> bool {
 /// Parsed and validated `volume_context` of a volume.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Export {
-    pub addr: IpAddr,
-    pub port: u16,
+    pub target: Target,
     /// Directory below the server's export root; becomes the 9P attach name.
     pub subpath: String,
 }
 
 impl Export {
-    pub fn from_context(ctx: &std::collections::HashMap<String, String>) -> Result<Self, Status> {
-        let server = ctx
-            .get("server")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Status::invalid_argument("volume_context.server is required"))?;
-        let port = match ctx.get("port") {
-            Some(p) => p
-                .parse()
-                .map_err(|_| Status::invalid_argument("volume_context.port is not a port"))?,
-            None => DEFAULT_PORT,
+    /// Validates the context without touching the network (names are resolved at dial time).
+    pub fn from_context(ctx: &HashMap<String, String>) -> Result<Self, Status> {
+        let get = |k: &str| ctx.get(k).filter(|v| !v.is_empty());
+        let target = match get("transport").map(String::as_str).unwrap_or("quic") {
+            "quic" => {
+                let host = get("server").ok_or_else(|| {
+                    Status::invalid_argument("server is required for transport quic")
+                })?;
+                let port = match get("port") {
+                    Some(p) => p
+                        .parse()
+                        .map_err(|_| Status::invalid_argument("port is not a port"))?,
+                    None => crate::DEFAULT_QUIC_PORT,
+                };
+                Target::Quic {
+                    host: host.clone(),
+                    port,
+                }
+            }
+            "iroh" => {
+                let node = get("iroh-node").ok_or_else(|| {
+                    Status::invalid_argument("iroh-node is required for transport iroh")
+                })?;
+                let addrs = get("iroh-addrs")
+                    .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default();
+                Target::Iroh {
+                    node: node.clone(),
+                    addrs,
+                }
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown transport {other:?} (want quic or iroh)"
+                )))
+            }
         };
-        // The kernel only accepts IP literals, so resolve names here.
-        let addr = (server.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| Status::invalid_argument(format!("resolve {server}: {e}")))?
-            .map(|a| a.ip())
-            .find(IpAddr::is_ipv4)
-            .or_else(|| {
-                (server.as_str(), port)
-                    .to_socket_addrs()
-                    .ok()?
-                    .next()
-                    .map(|a| a.ip())
-            })
-            .ok_or_else(|| Status::invalid_argument(format!("{server} has no address")))?;
         let subpath = ctx.get("subpath").cloned().unwrap_or_else(|| "/".into());
-        Ok(Export {
-            addr,
-            port,
-            subpath,
-        })
+        Ok(Export { target, subpath })
     }
 }
 
-pub fn mount_options(port: u16, subpath: &str, read_only: bool) -> String {
-    let mut o =
-        format!("trans=tcp,port={port},version=9p2000.L,msize={MSIZE},access=any,aname={subpath}");
+pub fn mount_options(subpath: &str, read_only: bool) -> String {
+    let mut o = format!("trans=unix,version=9p2000.L,msize={MSIZE},access=any,aname={subpath}");
     if read_only {
         o.push_str(",ro");
     }
@@ -110,6 +118,46 @@ struct Plugin {
     node_id: String,
     /// Set when running as the controller (the server's export directory).
     export_root: Option<PathBuf>,
+    /// Node mode: dials servers, and keeps one proxy per mounted target path.
+    dialer: Arc<Dialer>,
+    socket_dir: PathBuf,
+    proxies: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
+
+impl Plugin {
+    fn new(
+        node_id: String,
+        export_root: Option<PathBuf>,
+        tls: Option<ClientTls>,
+        socket_dir: PathBuf,
+    ) -> Self {
+        Plugin {
+            node_id,
+            export_root,
+            dialer: Arc::new(Dialer::new(tls)),
+            socket_dir,
+            proxies: Default::default(),
+        }
+    }
+
+    fn socket_for(&self, target: &Path) -> PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        target.hash(&mut h);
+        self.socket_dir.join(format!("{:016x}.sock", h.finish()))
+    }
+
+    fn stop_proxy(&self, target: &Path) {
+        if let Some(task) = self
+            .proxies
+            .lock()
+            .unwrap()
+            .remove(target.to_str().unwrap_or(""))
+        {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(self.socket_for(target));
+    }
 }
 
 #[tonic::async_trait]
@@ -162,14 +210,39 @@ impl Node for Plugin {
         if is_mounted(&target)? {
             return Ok(Response::new(NodePublishVolumeResponse {}));
         }
-        tracing::info!("mounting {}:{} on {target:?}", export.addr, export.port);
-        exec(
-            Command::new("mount")
-                .args(["-t", "9p", "-o"])
-                .arg(mount_options(export.port, &export.subpath, req.readonly))
-                .arg(export.addr.to_string())
-                .arg(&target),
-        )?;
+        tracing::info!("mounting {:?} on {target:?}", export.target);
+        // The kernel 9p client only does tcp/unix; it talks to a local proxy that
+        // carries the stream over QUIC/iroh.
+        std::fs::create_dir_all(&self.socket_dir)
+            .map_err(|e| Status::internal(format!("mkdir {:?}: {e}", self.socket_dir)))?;
+        let sock = self.socket_for(&target);
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock)
+            .map_err(|e| Status::internal(format!("bind {sock:?}: {e}")))?;
+        let task = tokio::spawn(proxy(listener, self.dialer.clone(), export.target));
+        self.proxies
+            .lock()
+            .unwrap()
+            .insert(req.target_path.clone(), task);
+        let mount = tokio::task::spawn_blocking({
+            let opts = mount_options(&export.subpath, req.readonly);
+            let target = target.clone();
+            move || {
+                exec(
+                    Command::new("mount")
+                        .args(["-t", "9p", "-o"])
+                        .arg(opts)
+                        .arg(&sock)
+                        .arg(&target),
+                )
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        if let Err(e) = mount {
+            self.stop_proxy(&target);
+            return Err(e);
+        }
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
@@ -188,6 +261,7 @@ impl Node for Plugin {
             tracing::info!("unmounting {target:?}");
             exec(Command::new("umount").arg(&target))?;
         }
+        self.stop_proxy(&target);
         let _ = std::fs::remove_dir(&target);
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
@@ -254,26 +328,22 @@ impl Controller for Plugin {
         if req.volume_capabilities.is_empty() {
             return Err(Status::invalid_argument("volume_capabilities is required"));
         }
-        let server = req
-            .parameters
-            .get("server")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Status::invalid_argument("StorageClass parameter `server` is required")
-            })?;
         let dir = root.join(&req.name);
+        // Everything but the CSI-internal keys becomes the node's volume_context;
+        // validate it now so bad StorageClasses fail at provisioning, not at mount.
+        let mut volume_context: HashMap<String, String> = req
+            .parameters
+            .iter()
+            .filter(|(k, _)| !k.starts_with("csi.storage.k8s.io/"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        volume_context.insert("subpath".into(), req.name.clone());
+        Export::from_context(&volume_context)?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| Status::internal(format!("mkdir {dir:?}: {e}")))?;
         // Pods run as arbitrary uids; the volume is the isolation boundary.
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o777))
             .map_err(|e| Status::internal(format!("chmod {dir:?}: {e}")))?;
-        let mut volume_context = std::collections::HashMap::from([
-            ("server".to_string(), server.clone()),
-            ("subpath".to_string(), req.name.clone()),
-        ]);
-        if let Some(port) = req.parameters.get("port") {
-            volume_context.insert("port".into(), port.clone());
-        }
         tracing::info!("created volume {}", req.name);
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
@@ -430,7 +500,13 @@ impl Plugin {
 }
 
 /// Runs the node service, or the controller service when `export_root` is set.
-pub async fn run(endpoint: PathBuf, node_id: String, export_root: Option<PathBuf>) -> Result<()> {
+pub async fn run(
+    endpoint: PathBuf,
+    node_id: String,
+    export_root: Option<PathBuf>,
+    tls: Option<ClientTls>,
+    socket_dir: PathBuf,
+) -> Result<()> {
     if let Some(dir) = endpoint.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -438,10 +514,7 @@ pub async fn run(endpoint: PathBuf, node_id: String, export_root: Option<PathBuf
     let listener = UnixListener::bind(&endpoint).context("bind csi socket")?;
     tracing::info!("csi {DRIVER_NAME} listening on {endpoint:?}");
     let controller = export_root.is_some();
-    let plugin = Plugin {
-        node_id,
-        export_root,
-    };
+    let plugin = Plugin::new(node_id, export_root, tls, socket_dir);
     let mut server = tonic::transport::Server::builder();
     let router = server.add_service(IdentityServer::new(plugin.clone()));
     let router = if controller {
@@ -467,44 +540,67 @@ mod tests {
     }
 
     #[test]
-    fn parses_export() {
-        let e = Export::from_context(&ctx(&[("server", "10.0.0.7"), ("port", "9000")])).unwrap();
+    fn parses_quic_export() {
+        let e = Export::from_context(&ctx(&[("server", "ufs.svc"), ("port", "9000")])).unwrap();
         assert_eq!(
             e,
             Export {
-                addr: "10.0.0.7".parse().unwrap(),
-                port: 9000,
+                target: Target::Quic {
+                    host: "ufs.svc".into(),
+                    port: 9000
+                },
                 subpath: "/".into()
             }
         );
-        let e = Export::from_context(&ctx(&[("server", "127.0.0.1")])).unwrap();
-        assert_eq!(e.port, DEFAULT_PORT);
+        let e = Export::from_context(&ctx(&[("server", "ufs.svc"), ("subpath", "vol-1")])).unwrap();
+        assert_eq!(
+            e.target,
+            Target::Quic {
+                host: "ufs.svc".into(),
+                port: crate::DEFAULT_QUIC_PORT
+            }
+        );
+        assert_eq!(e.subpath, "vol-1");
+    }
+
+    #[test]
+    fn parses_iroh_export() {
+        let e = Export::from_context(&ctx(&[
+            ("transport", "iroh"),
+            ("iroh-node", "abc"),
+            ("iroh-addrs", "a:1, b:2"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            e.target,
+            Target::Iroh {
+                node: "abc".into(),
+                addrs: vec!["a:1".into(), "b:2".into()]
+            }
+        );
     }
 
     #[test]
     fn rejects_bad_context() {
         assert!(Export::from_context(&ctx(&[])).is_err());
-        assert!(Export::from_context(&ctx(&[("server", "127.0.0.1"), ("port", "x")])).is_err());
+        assert!(Export::from_context(&ctx(&[("server", "h"), ("port", "x")])).is_err());
+        assert!(Export::from_context(&ctx(&[("transport", "iroh")])).is_err());
+        assert!(Export::from_context(&ctx(&[("transport", "tcp"), ("server", "h")])).is_err());
     }
 
     #[test]
     fn options() {
-        assert!(mount_options(5640, "/", true).ends_with(",ro"));
-        assert!(!mount_options(5640, "/", false).contains(",ro"));
-        assert!(mount_options(5640, "vol-1", false).contains("aname=vol-1"));
+        assert!(mount_options("/", true).ends_with(",ro"));
+        assert!(!mount_options("/", false).contains(",ro"));
+        assert!(mount_options("vol-1", false).contains("aname=vol-1"));
+        assert!(mount_options("/", false).contains("trans=unix"));
     }
 
     #[test]
     fn controller_mode_reports_controller_service() {
-        let node = Plugin {
-            node_id: "n".into(),
-            export_root: None,
-        };
+        let node = Plugin::new("n".into(), None, None, "/tmp".into());
         assert!(node.plugin_capabilities().is_empty());
-        let ctl = Plugin {
-            node_id: "n".into(),
-            export_root: Some("/export".into()),
-        };
+        let ctl = Plugin::new("n".into(), Some("/export".into()), None, "/tmp".into());
         assert_eq!(ctl.plugin_capabilities().len(), 1);
     }
 
