@@ -94,10 +94,12 @@ fn spawn_server(root: &Path, extra: &[String]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    // Owning the child in a `Server` means it is killed and reaped on every path, panics included.
+    let server = Server { child, socket };
     // The unix socket is bound after the QUIC and iroh listeners.
     for _ in 0..200 {
-        if UnixStream::connect(&socket).is_ok() {
-            return Server { child, socket };
+        if UnixStream::connect(&server.socket).is_ok() {
+            return server;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
